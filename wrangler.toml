@@ -1,0 +1,7 @@
+   name = "screen"
+   main = "src/index.js"
+   compatibility_date = "2024-11-01"
+
+   [[kv_namespaces]]
+   binding = "VIDEOS"
+   id = "5009c1517db74258a40c3d0d2611e206"
