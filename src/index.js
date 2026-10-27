@@ -1,534 +1,525 @@
-// ============================================================================
-// youtube-worker.js  —  YouTube channel <-> Admin panel <-> Site (Cloudflare Worker)
-//
-// What it does
-//   1. Admin panel  (/admin/youtube): paste a "Copy as cURL (bash)" command (or a raw
-//      Cookie header) from your logged-in YouTube tab. The Worker extracts the cookie,
-//      stores it in D1, verifies it, detects your channel and syncs ALL channel videos.
-//   2. Admin panel shows the connected channel + every video (hide / show per video).
-//   3. Site: /youtube (video grid + player) and /api/youtube/videos (JSON for your
-//      existing site). Visitors never see the cookie.
-//
-// Bindings needed (wrangler.toml)
-//   [[d1_databases]]  binding = "DB"  database_name = "glitz-screen-db"  database_id = "..."
-//   [triggers]        crons = ["0 */6 * * *"]        # optional auto-sync every 6h
-//   Secret:           wrangler secret put ADMIN_PASSWORD
-//
-// Use standalone (export default below) OR inside your existing index.js:
-//   import { handleYouTube, syncYouTube } from "./youtube-worker.js";
-//   const yt = await handleYouTube(request, env, ctx); if (yt) return yt;
-//   // and in scheduled(): ctx.waitUntil(syncYouTube(env));
-// ============================================================================
+// Cloudflare Worker: YouTube OAuth connect + admin panel + futuristic public site
+// Bindings: KV (namespace)
+// Secrets: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, ADMIN_PASSWORD, SECRET_KEY
 
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+const SCOPE = "https://www.googleapis.com/auth/youtube.readonly";
+const enc = new TextEncoder();
 
-// ----------------------------------------------------------------- utilities
-const esc = (s) =>
-  String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const p = url.pathname;
+    const m = request.method;
+    try {
+      if (p === "/") return html(siteHTML());
+      if (p === "/admin") return html(adminHTML(await isAdmin(request, env)));
+      if (p === "/admin/login" && m === "POST") return adminLogin(request, env);
+      if (p === "/admin/logout") return setCookie(redirect("/admin"), "adm", "", 0);
+      if (p === "/auth/start") return authStart(url, request, env);
+      if (p === "/auth/callback") return authCallback(url, request, env);
+      if (p === "/api/site" && m === "GET") return getSite(env);
+      if (p === "/api/logout" && m === "POST") return setCookie(json({ ok: true }), "own", "", 0);
 
-const json = (obj, status = 200) =>
-  new Response(JSON.stringify(obj), {
-    status,
-    headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
-  });
+      const vm = p.match(/^\/api\/channel\/([\w-]+)\/videos$/);
+      if (vm && m === "GET") return channelVideos(vm[1], request, env);
 
-const html = (body, status = 200, cache = "no-store") =>
-  new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8", "cache-control": cache } });
-
-async function hmac(secret, data) {
-  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(data));
-  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-async function sha1hex(s) {
-  const buf = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(s));
-  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-function safeEqual(a, b) {
-  if (a.length !== b.length) return false;
-  let r = 0;
-  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return r === 0;
-}
-
-// ------------------------------------------------------------------ D1 setup
-let schemaReady = false;
-async function ensureSchema(env) {
-  if (schemaReady) return;
-  await env.DB.prepare("CREATE TABLE IF NOT EXISTS yt_settings (k TEXT PRIMARY KEY, v TEXT)").run();
-  await env.DB.prepare(
-    `CREATE TABLE IF NOT EXISTS yt_videos (
-      video_id TEXT PRIMARY KEY, title TEXT, thumb TEXT, duration TEXT, views TEXT,
-      published TEXT, position INTEGER DEFAULT 0, hidden INTEGER DEFAULT 0, updated_at INTEGER)`
-  ).run();
-  schemaReady = true;
-}
-async function getSetting(env, k) {
-  const r = await env.DB.prepare("SELECT v FROM yt_settings WHERE k=?").bind(k).first();
-  return r ? r.v : null;
-}
-async function setSetting(env, k, v) {
-  await env.DB.prepare("INSERT INTO yt_settings (k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").bind(k, v).run();
-}
-async function delSetting(env, k) {
-  await env.DB.prepare("DELETE FROM yt_settings WHERE k=?").bind(k).run();
-}
-
-// ---------------------------------------------------- cURL / cookie parsing
-// Accepts: full "Copy as cURL (bash)" text, a "Cookie: ..." line, or just "a=b; c=d".
-export function extractCookie(input) {
-  let text = String(input || "").replace(/\\\r?\n/g, " ").trim();
-  if (!text) return "";
-
-  // Tokenize shell-ish quoting: '...', "...", $'...'
-  const tokens = [];
-  const re = /\$'((?:\\.|[^'\\])*)'|'([^']*)'|"((?:\\.|[^"\\])*)"|(\S+)/g;
-  let m;
-  while ((m = re.exec(text))) tokens.push(m[1] ?? m[2] ?? m[3] ?? m[4]);
-
-  for (let i = 0; i < tokens.length; i++) {
-    const t = tokens[i];
-    if ((t === "-H" || t === "--header") && tokens[i + 1]) {
-      const h = tokens[i + 1];
-      const mm = h.match(/^\s*cookie\s*:\s*(.+)$/i);
-      if (mm) return mm[1].trim();
+      if (p.startsWith("/api/admin/")) {
+        if (!(await isAdmin(request, env))) return json({ error: "unauthorized" }, 401);
+        return adminApi(p, m, request, env);
+      }
+      return new Response("Not found", { status: 404 });
+    } catch (e) {
+      return json({ error: e.message }, 500);
     }
-    if ((t === "-b" || t === "--cookie") && tokens[i + 1]) return tokens[i + 1].trim();
-    if (/^cookie:/i.test(t)) return t.replace(/^cookie:\s*/i, "").trim();
-  }
-  const line = text.match(/^\s*cookie\s*:\s*(.+)$/im);
-  if (line) return line[1].trim();
-  if (/^[^\s=;]+=[^;]*(;|$)/.test(text) && !/^curl\b/i.test(text)) return text;
-  return "";
-}
+  },
+};
 
-function cookieNames(cookie) {
-  return cookie.split(";").map((c) => c.trim().split("=")[0]).filter(Boolean);
+/* ---------- helpers ---------- */
+
+const json = (d, s = 200) =>
+  new Response(JSON.stringify(d), { status: s, headers: { "Content-Type": "application/json" } });
+const html = (b, s = 200) =>
+  new Response(b, { status: s, headers: { "Content-Type": "text/html;charset=utf-8" } });
+const redirect = (to) => new Response(null, { status: 302, headers: { Location: to } });
+const pub = (c) => ({ id: c.id, title: c.title, thumb: c.thumb });
+
+function setCookie(res, name, val, maxAge) {
+  res.headers.append("Set-Cookie", `${name}=${val}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`);
+  return res;
 }
-function getCookieValue(cookie, name) {
-  const m = cookie.match(new RegExp("(?:^|;\\s*)" + name + "=([^;]*)"));
+function getCookie(req, name) {
+  const m = (req.headers.get("Cookie") || "").match(new RegExp("(?:^|;\\s*)" + name + "=([^;]*)"));
   return m ? m[1] : null;
 }
 
-// -------------------------------------------------------------- YouTube calls
-async function sapisidHash(cookie, origin) {
-  const sid = getCookieValue(cookie, "SAPISID") || getCookieValue(cookie, "__Secure-3PAPISID");
-  if (!sid) return null;
-  const ts = Math.floor(Date.now() / 1000);
-  return `SAPISIDHASH ${ts}_${await sha1hex(`${ts} ${sid} ${origin}`)}`;
+async function hmacKey(env) {
+  return crypto.subtle.importKey("raw", enc.encode(env.SECRET_KEY),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
+}
+function b64url(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+async function sign(env, data) {
+  return b64url(await crypto.subtle.sign("HMAC", await hmacKey(env), enc.encode(data)));
+}
+async function makeToken(env, data, ttlSec) {
+  const body = data + "|" + (Date.now() + ttlSec * 1000);
+  return body + "." + (await sign(env, body));
+}
+async function checkToken(env, token) {
+  if (!token || !token.includes(".")) return null;
+  const i = token.lastIndexOf(".");
+  const body = token.slice(0, i);
+  if ((await sign(env, body)) !== token.slice(i + 1)) return null;
+  const [data, exp] = body.split("|");
+  return Date.now() > +exp ? null : data;
 }
 
-function ytHeaders(cookie) {
-  return {
-    cookie,
-    "user-agent": UA,
-    "accept-language": "en-US,en;q=0.9",
-    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+async function isAdmin(request, env) {
+  return (await checkToken(env, getCookie(request, "adm"))) === "admin";
+}
+
+async function getSettings(env) {
+  return (await env.KV.get("settings", "json")) || {
+    title: "NEXUS TUBE", subtitle: "Neural video archive", accent: "#00f0ff",
+    published: false, featured: null,
   };
 }
-
-async function fetchYT(url, cookie, init = {}) {
-  return fetch(url, { redirect: "follow", ...init, headers: { ...ytHeaders(cookie), ...(init.headers || {}) } });
-}
-
-function parseInitialData(page) {
-  const m = page.match(/var ytInitialData\s*=\s*(\{.+?\});\s*<\/script>/s) || page.match(/ytInitialData"\]\s*=\s*(\{.+?\});/s);
-  if (!m) return null;
-  try { return JSON.parse(m[1]); } catch { return null; }
-}
-
-function walk(node, visit) {
-  if (Array.isArray(node)) { for (const n of node) walk(n, visit); return; }
-  if (node && typeof node === "object") {
-    visit(node);
-    for (const k in node) walk(node[k], visit);
+async function listChannels(env) {
+  const ids = (await env.KV.get("index", "json")) || [];
+  const out = [];
+  for (const id of ids) {
+    const c = await env.KV.get("ch:" + id, "json");
+    if (c) out.push(c);
   }
+  return out;
 }
 
-function extractVideos(data) {
-  const out = new Map();
-  let continuation = null;
-  walk(data, (o) => {
-    const r = o.videoRenderer || o.gridVideoRenderer;
-    if (r && r.videoId) {
-      const thumbs = r.thumbnail?.thumbnails || [];
-      out.set(r.videoId, {
-        id: r.videoId,
-        title: r.title?.runs?.map((x) => x.text).join("") || r.title?.simpleText || "Untitled",
-        thumb: thumbs.length ? thumbs[thumbs.length - 1].url.split("?")[0] : `https://i.ytimg.com/vi/${r.videoId}/hqdefault.jpg`,
-        duration: r.lengthText?.simpleText || "",
-        views: r.viewCountText?.simpleText || "",
-        published: r.publishedTimeText?.simpleText || "",
-      });
-    }
-    // newer layout
-    if (o.lockupViewModel && o.lockupViewModel.contentType === "LOCKUP_CONTENT_TYPE_VIDEO" && o.lockupViewModel.contentId) {
-      const l = o.lockupViewModel;
-      const id = l.contentId;
-      let duration = "", meta = [];
-      walk(l, (x) => {
-        if (x.thumbnailBadgeViewModel?.text) duration = x.thumbnailBadgeViewModel.text;
-        if (Array.isArray(x.metadataParts)) x.metadataParts.forEach((p) => p.text?.content && meta.push(p.text.content));
-      });
-      out.set(id, {
-        id,
-        title: l.metadata?.lockupMetadataViewModel?.title?.content || "Untitled",
-        thumb: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
-        duration,
-        views: meta[0] || "",
-        published: meta[1] || "",
-      });
-    }
-    const c = o.continuationItemRenderer?.continuationEndpoint?.continuationCommand?.token;
-    if (c) continuation = c;
+async function yt(path, token) {
+  const r = await fetch("https://www.googleapis.com/youtube/v3/" + path, {
+    headers: { Authorization: "Bearer " + token },
   });
-  return { videos: [...out.values()], continuation };
+  const d = await r.json();
+  if (d.error) throw new Error(d.error.message);
+  return d;
+}
+async function accessToken(env, refresh) {
+  const r = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET,
+      refresh_token: refresh, grant_type: "refresh_token",
+    }),
+  });
+  const d = await r.json();
+  if (!d.access_token) throw new Error("Token refresh failed. Reconnect the channel.");
+  return d.access_token;
 }
 
-async function detectChannel(cookie) {
-  const res = await fetchYT("https://www.youtube.com/account_advanced", cookie);
-  if (/accounts\.google\.com|ServiceLogin/.test(res.url)) return { error: "Cookie is not logged in (expired or incomplete)." };
-  const page = await res.text();
-  const m = page.match(/"channelId":"(UC[\w-]{22})"/) || page.match(/\/channel\/(UC[\w-]{22})/) || page.match(/(UC[\w-]{22})/);
-  if (!m) return { error: "Logged in, but could not detect a channel id. Enter your channel handle/ID manually." };
-  return { channelId: m[1] };
+/* ---------- admin login ---------- */
+
+async function adminLogin(request, env) {
+  const form = await request.formData();
+  if (form.get("password") !== env.ADMIN_PASSWORD) return redirect("/admin?err=1");
+  const tok = await makeToken(env, "admin", 60 * 60 * 12);
+  return setCookie(redirect("/admin"), "adm", tok, 60 * 60 * 12);
 }
 
-async function resolveChannelInput(input, cookie) {
-  const s = String(input || "").trim();
-  if (!s) return detectChannel(cookie);
-  let m = s.match(/(UC[\w-]{22})/);
-  if (m) return { channelId: m[1] };
-  m = s.match(/@[\w.\-]+/);
-  const handle = m ? m[0] : s.startsWith("@") ? s : "@" + s;
-  const res = await fetchYT(`https://www.youtube.com/${handle}`, cookie);
-  const page = await res.text();
-  const c = page.match(/"channelId":"(UC[\w-]{22})"/) || page.match(/channel\/(UC[\w-]{22})/);
-  return c ? { channelId: c[1] } : { error: "Could not resolve that handle: " + handle };
+/* ---------- OAuth ---------- */
+
+async function authStart(url, request, env) {
+  const role = url.searchParams.get("role") === "admin" ? "admin" : "user";
+  if (role === "admin" && !(await isAdmin(request, env))) return redirect("/admin");
+  const nonce = crypto.randomUUID();
+  const q = new URLSearchParams({
+    client_id: env.GOOGLE_CLIENT_ID,
+    redirect_uri: url.origin + "/auth/callback",
+    response_type: "code",
+    scope: SCOPE,
+    access_type: "offline",
+    prompt: "consent",
+    state: nonce,
+  });
+  return setCookie(redirect("https://accounts.google.com/o/oauth2/v2/auth?" + q),
+    "oauth", nonce + "." + role, 600);
 }
 
-export async function syncYouTube(env) {
-  await ensureSchema(env);
-  const cookie = await getSetting(env, "cookie");
-  if (!cookie) return { ok: false, error: "No cookie connected." };
-  let channelId = await getSetting(env, "channel_id");
-  if (!channelId) {
-    const d = await detectChannel(cookie);
-    if (d.error) return { ok: false, error: d.error };
-    channelId = d.channelId;
-    await setSetting(env, "channel_id", channelId);
+async function authCallback(url, request, env) {
+  const [nonce, role] = (getCookie(request, "oauth") || "").split(".");
+  if (!nonce || url.searchParams.get("state") !== nonce)
+    return html("Invalid OAuth state. <a href='/'>Back</a>", 400);
+  const code = url.searchParams.get("code");
+  if (!code) return html("Connection cancelled. <a href='/'>Back</a>", 400);
+
+  const tr = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      code, client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET,
+      redirect_uri: url.origin + "/auth/callback", grant_type: "authorization_code",
+    }),
+  });
+  const tok = await tr.json();
+  if (!tok.access_token) return json(tok, 400);
+
+  const d = await yt("channels?part=snippet&mine=true", tok.access_token);
+  const ch = d.items && d.items[0];
+  if (!ch) return html("This Google account has no YouTube channel.", 400);
+
+  const old = await env.KV.get("ch:" + ch.id, "json");
+  const refresh = tok.refresh_token || (old && old.refreshToken);
+  if (!refresh) return html("No refresh token received. Remove the app at myaccount.google.com/permissions and retry.", 400);
+
+  const kind = role === "admin" ? "admin" : (old && old.kind) || "user";
+  await env.KV.put("ch:" + ch.id, JSON.stringify({
+    id: ch.id, title: ch.snippet.title,
+    thumb: (ch.snippet.thumbnails && ch.snippet.thumbnails.default && ch.snippet.thumbnails.default.url) || "",
+    kind, refreshToken: refresh, connectedAt: Date.now(),
+  }));
+
+  const ids = (await env.KV.get("index", "json")) || [];
+  if (!ids.includes(ch.id)) {
+    ids.push(ch.id);
+    await env.KV.put("index", JSON.stringify(ids));
   }
 
-  const res = await fetchYT(`https://www.youtube.com/channel/${channelId}/videos`, cookie);
-  if (/accounts\.google\.com|ServiceLogin/.test(res.url)) {
-    await setSetting(env, "status", "expired");
-    return { ok: false, error: "Cookie expired. Paste a fresh cURL in the admin panel." };
-  }
-  const page = await res.text();
-  const data = parseInitialData(page);
-  if (!data) return { ok: false, error: "Could not read the channel page (YouTube layout/consent page)." };
-
-  // Channel info
-  const meta = data.metadata?.channelMetadataRenderer;
-  if (meta?.title) await setSetting(env, "channel_title", meta.title);
-  if (meta?.avatar?.thumbnails?.[0]?.url) await setSetting(env, "channel_avatar", meta.avatar.thumbnails[0].url);
-
-  const clientVersion = (page.match(/"INNERTUBE_CLIENT_VERSION":"([^"]+)"/) || [])[1] || "2.20251020.01.00";
-  const apiKey = (page.match(/"INNERTUBE_API_KEY":"([^"]+)"/) || [])[1];
-
-  let { videos, continuation } = extractVideos(data);
-  const all = new Map(videos.map((v) => [v.id, v]));
-
-  // Pagination through the whole channel (cap at 60 pages ≈ thousands of videos)
-  for (let page_i = 0; continuation && page_i < 60; page_i++) {
-    const auth = await sapisidHash(cookie, "https://www.youtube.com");
-    const r = await fetch(
-      "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false" + (apiKey ? "&key=" + apiKey : ""),
-      {
-        method: "POST",
-        headers: {
-          ...ytHeaders(cookie),
-          "content-type": "application/json",
-          origin: "https://www.youtube.com",
-          "x-origin": "https://www.youtube.com",
-          "x-goog-authuser": "0",
-          ...(auth ? { authorization: auth } : {}),
-        },
-        body: JSON.stringify({
-          context: { client: { clientName: "WEB", clientVersion, hl: "en", gl: "US" } },
-          continuation,
-        }),
-      }
-    );
-    if (!r.ok) break;
-    const d = await r.json().catch(() => null);
-    if (!d) break;
-    const next = extractVideos(d);
-    next.videos.forEach((v) => all.set(v.id, v));
-    if (!next.videos.length) break;
-    continuation = next.continuation;
+  if (kind === "admin") {
+    const s = await getSettings(env);
+    if (!s.featured) {
+      s.featured = ch.id;
+      await env.KV.put("settings", JSON.stringify(s));
+    }
+    return setCookie(redirect("/admin"), "oauth", "", 0);
   }
 
-  const list = [...all.values()];
-  if (!list.length) return { ok: false, error: "Connected, but no videos were found on the channel's Videos tab." };
-
-  const now = Date.now();
-  const stmts = list.map((v, i) =>
-    env.DB.prepare(
-      `INSERT INTO yt_videos (video_id,title,thumb,duration,views,published,position,updated_at)
-       VALUES (?,?,?,?,?,?,?,?)
-       ON CONFLICT(video_id) DO UPDATE SET title=excluded.title, thumb=excluded.thumb,
-         duration=excluded.duration, views=excluded.views, published=excluded.published,
-         position=excluded.position, updated_at=excluded.updated_at`
-    ).bind(v.id, v.title, v.thumb, v.duration, v.views, v.published, i, now)
-  );
-  for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
-
-  await setSetting(env, "last_sync", String(now));
-  await setSetting(env, "status", "connected");
-  return { ok: true, count: list.length };
+  // Regular user: grant owner cookie so they can see their own private videos
+  const own = await makeToken(env, "owner:" + ch.id, 60 * 60 * 24 * 30);
+  return setCookie(setCookie(redirect("/#/c/" + ch.id), "own", own, 60 * 60 * 24 * 30),
+    "oauth", "", 0);
 }
 
-// ------------------------------------------------------------- admin session
-async function isAdmin(request, env) {
-  if (!env.ADMIN_PASSWORD) return false;
-  const c = request.headers.get("cookie") || "";
-  const m = c.match(/(?:^|;\s*)yt_admin=([^;]+)/);
-  if (!m) return false;
-  const [exp, sig] = decodeURIComponent(m[1]).split(".");
-  if (!exp || !sig || Number(exp) < Date.now()) return false;
-  return safeEqual(sig, await hmac(env.ADMIN_PASSWORD, "yt|" + exp));
+/* ---------- public API ---------- */
+
+async function getSite(env) {
+  const s = await getSettings(env);
+  const all = await listChannels(env);
+  const featured = s.published && s.featured ? all.find((c) => c.id === s.featured) : null;
+  return json({
+    title: s.title, subtitle: s.subtitle, accent: s.accent, published: s.published,
+    featured: featured ? pub(featured) : null,
+    users: all.filter((c) => c.kind === "user").map(pub),
+  });
 }
 
-// ------------------------------------------------------------------- router
-export async function handleYouTube(request, env, ctx) {
-  const url = new URL(request.url);
-  const p = url.pathname.replace(/\/+$/, "") || "/";
-  const isYT =
-    p === "/youtube" || p === "/api/youtube/videos" || p.startsWith("/admin/youtube") || p.startsWith("/admin/api/yt");
-  if (!isYT) return null;
-  if (!env.DB) return json({ error: "D1 binding DB is missing" }, 500);
-  await ensureSchema(env);
+async function channelVideos(id, request, env) {
+  const ch = await env.KV.get("ch:" + id, "json");
+  if (!ch) return json({ error: "Channel not found" }, 404);
 
-  // ---------- public
-  if (p === "/api/youtube/videos") {
-    const { results } = await env.DB.prepare(
-      "SELECT video_id AS id,title,thumb,duration,views,published FROM yt_videos WHERE hidden=0 ORDER BY position ASC"
-    ).all();
-    const res = json({
-      channel: { id: await getSetting(env, "channel_id"), title: await getSetting(env, "channel_title"), avatar: await getSetting(env, "channel_avatar") },
-      videos: results,
-    });
-    res.headers.set("cache-control", "public, max-age=120");
-    res.headers.set("access-control-allow-origin", "*");
-    return res;
-  }
-  if (p === "/youtube") {
-    const { results } = await env.DB.prepare(
-      "SELECT video_id AS id,title,thumb,duration,views,published FROM yt_videos WHERE hidden=0 ORDER BY position ASC"
-    ).all();
-    return html(sitePage(results, await getSetting(env, "channel_title"), await getSetting(env, "channel_avatar")), 200, "public, max-age=120");
-  }
+  const s = await getSettings(env);
+  const visible = ch.kind === "user" || (s.published && s.featured === id);
+  if (!visible) return json({ error: "Channel not public" }, 403);
 
-  // ---------- admin login
-  if (p === "/admin/youtube/login" && request.method === "POST") {
-    const form = await request.formData();
-    if (!env.ADMIN_PASSWORD || !safeEqual(String(form.get("password") || ""), env.ADMIN_PASSWORD))
-      return html(loginPage("Wrong password"), 401);
-    const exp = String(Date.now() + 7 * 864e5);
-    const token = encodeURIComponent(exp + "." + (await hmac(env.ADMIN_PASSWORD, "yt|" + exp)));
-    return new Response(null, {
-      status: 302,
-      headers: { location: "/admin/youtube", "set-cookie": `yt_admin=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=604800` },
-    });
-  }
-  if (p === "/admin/youtube/logout") {
-    return new Response(null, { status: 302, headers: { location: "/admin/youtube", "set-cookie": "yt_admin=; Path=/; Max-Age=0" } });
-  }
-  if (!(await isAdmin(request, env))) {
-    if (p.startsWith("/admin/api/")) return json({ error: "unauthorized" }, 401);
-    return html(loginPage(env.ADMIN_PASSWORD ? "" : "Set the ADMIN_PASSWORD secret first"));
-  }
+  const owner = (await checkToken(env, getCookie(request, "own"))) === "owner:" + id;
+  const admin = ch.kind === "admin" && (await isAdmin(request, env));
+  const canPrivate = owner || admin;
 
-  // ---------- admin API
-  if (p === "/admin/youtube") return html(adminPage());
+  const token = await accessToken(env, ch.refreshToken);
+  const cd = await yt("channels?part=contentDetails&mine=true", token);
+  const uploads = cd.items[0].contentDetails.relatedPlaylists.uploads;
+  const pl = await yt("playlistItems?part=snippet,status&maxResults=50&playlistId=" + uploads, token);
 
-  if (p === "/admin/api/yt/status") {
-    const cookie = await getSetting(env, "cookie");
-    const cnt = await env.DB.prepare("SELECT COUNT(*) c, SUM(hidden) h FROM yt_videos").first();
-    const { results } = await env.DB.prepare(
-      "SELECT video_id AS id,title,thumb,duration,views,published,hidden FROM yt_videos ORDER BY position ASC"
-    ).all();
+  let videos = pl.items.map((i) => ({
+    id: i.snippet.resourceId.videoId,
+    title: i.snippet.title,
+    thumb: (i.snippet.thumbnails && i.snippet.thumbnails.medium && i.snippet.thumbnails.medium.url) || "",
+    privacy: i.status.privacyStatus,
+    published: i.snippet.publishedAt,
+  }));
+  if (!canPrivate) videos = videos.filter((v) => v.privacy !== "private");
+  return json({ channel: pub(ch), canPrivate, videos });
+}
+
+/* ---------- admin API ---------- */
+
+async function adminApi(p, m, request, env) {
+  if (p === "/api/admin/state" && m === "GET") {
+    const s = await getSettings(env);
+    const chans = await listChannels(env);
     return json({
-      connected: !!cookie,
-      status: await getSetting(env, "status"),
-      channel: { id: await getSetting(env, "channel_id"), title: await getSetting(env, "channel_title"), avatar: await getSetting(env, "channel_avatar") },
-      cookieInfo: cookie ? { length: cookie.length, names: cookieNames(cookie) } : null, // values are never returned
-      lastSync: Number(await getSetting(env, "last_sync")) || null,
-      total: cnt.c || 0,
-      hidden: cnt.h || 0,
-      videos: results,
+      settings: s,
+      channels: chans.map((c) => ({ ...pub(c), kind: c.kind, connectedAt: c.connectedAt })),
     });
   }
 
-  if (p === "/admin/api/yt/connect" && request.method === "POST") {
-    const body = await request.json().catch(() => ({}));
-    const cookie = extractCookie(body.curl);
-    if (!cookie) return json({ ok: false, error: "No Cookie header found in what you pasted." }, 400);
-    const names = cookieNames(cookie);
-    if (!names.includes("SAPISID") && !names.includes("__Secure-3PAPISID") && !names.includes("SID"))
-      return json({ ok: false, error: "This cookie has no Google login (SID / SAPISID). Copy the cURL from a logged-in youtube.com request." }, 400);
-    const ch = await resolveChannelInput(body.channel, cookie);
-    if (ch.error) return json({ ok: false, error: ch.error }, 400);
-    await setSetting(env, "cookie", cookie);
-    await setSetting(env, "channel_id", ch.channelId);
-    const sync = await syncYouTube(env);
-    return json(sync, sync.ok ? 200 : 502);
+  if (p === "/api/admin/settings" && m === "POST") {
+    const body = await request.json();
+    const s = { ...(await getSettings(env)) };
+    for (const k of ["title", "subtitle", "accent", "published", "featured"]) {
+      if (k in body) s[k] = body[k];
+    }
+    if (s.published && !s.featured) return json({ error: "Connect and feature a channel before publishing." }, 400);
+    await env.KV.put("settings", JSON.stringify(s));
+    return json({ ok: true, settings: s });
   }
 
-  if (p === "/admin/api/yt/sync" && request.method === "POST") {
-    const sync = await syncYouTube(env);
-    return json(sync, sync.ok ? 200 : 502);
-  }
-
-  if (p === "/admin/api/yt/disconnect" && request.method === "POST") {
-    for (const k of ["cookie", "channel_id", "channel_title", "channel_avatar", "status", "last_sync"]) await delSetting(env, k);
-    if (new URL(request.url).searchParams.get("purge") === "1") await env.DB.prepare("DELETE FROM yt_videos").run();
-    return json({ ok: true });
-  }
-
-  if (p === "/admin/api/yt/hide" && request.method === "POST") {
-    const { id, hidden } = await request.json();
-    await env.DB.prepare("UPDATE yt_videos SET hidden=? WHERE video_id=?").bind(hidden ? 1 : 0, String(id)).run();
+  const dm = p.match(/^\/api\/admin\/channel\/([\w-]+)$/);
+  if (dm && m === "DELETE") {
+    const id = dm[1];
+    const c = await env.KV.get("ch:" + id, "json");
+    if (c) {
+      await fetch("https://oauth2.googleapis.com/revoke", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ token: c.refreshToken }),
+      }).catch(() => {});
+    }
+    await env.KV.delete("ch:" + id);
+    const ids = ((await env.KV.get("index", "json")) || []).filter((x) => x !== id);
+    await env.KV.put("index", JSON.stringify(ids));
+    const s = await getSettings(env);
+    if (s.featured === id) {
+      s.featured = null;
+      s.published = false;
+      await env.KV.put("settings", JSON.stringify(s));
+    }
     return json({ ok: true });
   }
 
   return json({ error: "not found" }, 404);
 }
 
-// ------------------------------------------------------------------- HTML
+/* ---------- pages ---------- */
+
 const BASE_CSS = `
-*{box-sizing:border-box}body{margin:0;background:#0f1115;color:#e8eaf0;font:15px/1.5 system-ui,Segoe UI,Roboto,sans-serif}
-a{color:inherit}.wrap{max-width:1200px;margin:0 auto;padding:20px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:16px}
-.card{background:#181b22;border:1px solid #262a35;border-radius:12px;overflow:hidden;cursor:pointer;position:relative}
-.card img{width:100%;aspect-ratio:16/9;object-fit:cover;display:block;background:#222}
-.card .t{padding:10px 12px 12px;font-weight:600;font-size:14px}.card .m{padding:0 12px 12px;color:#8b93a7;font-size:12px}
-.dur{position:absolute;right:8px;top:calc(56.25% * 1 - 30px);background:#000c;color:#fff;font-size:12px;padding:1px 6px;border-radius:4px}
-button,.btn{background:#e62117;color:#fff;border:0;border-radius:8px;padding:9px 14px;font-weight:600;cursor:pointer;font-size:14px}
-button.sec{background:#2a2f3b}button:disabled{opacity:.5}
-input,textarea{width:100%;background:#12141a;color:#e8eaf0;border:1px solid #2b3040;border-radius:8px;padding:10px;font:13px ui-monospace,Consolas,monospace}
+:root{--accent:#00f0ff;--pink:#ff00e6;--bg:#05060d}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;color:#e6f7ff;font-family:ui-monospace,Menlo,Consolas,monospace;
+  background:radial-gradient(circle at 15% 0%,#1d0b3f 0,transparent 40%),
+             radial-gradient(circle at 90% 100%,#003a4a 0,transparent 45%),var(--bg)}
+body::before{content:"";position:fixed;inset:0;pointer-events:none;
+  background-image:linear-gradient(rgba(0,240,255,.07) 1px,transparent 1px),
+                   linear-gradient(90deg,rgba(0,240,255,.07) 1px,transparent 1px);
+  background-size:42px 42px}
+.wrap{position:relative;max-width:1200px;margin:0 auto;padding:28px 20px}
+h1{font-size:clamp(22px,4vw,40px);letter-spacing:.25em;text-transform:uppercase;margin:0;
+  color:#fff;text-shadow:0 0 14px var(--accent),0 0 40px var(--accent)}
+.sub{opacity:.6;letter-spacing:.15em;font-size:12px;margin-top:6px}
+.glass{background:rgba(255,255,255,.04);border:1px solid rgba(0,240,255,.28);
+  backdrop-filter:blur(14px);border-radius:18px;box-shadow:0 0 30px rgba(0,240,255,.12),inset 0 0 20px rgba(255,0,230,.04)}
+.btn{display:inline-block;cursor:pointer;text-decoration:none;color:#00121a;font-weight:700;letter-spacing:.1em;
+  border:0;padding:12px 20px;border-radius:12px;background:linear-gradient(90deg,var(--accent),var(--pink));
+  box-shadow:0 0 22px rgba(0,240,255,.45);font-family:inherit;font-size:14px}
+.btn.ghost{background:transparent;color:var(--accent);border:1px solid var(--accent);box-shadow:none}
+.btn.danger{background:transparent;color:#ff4d6d;border:1px solid #ff4d6d;box-shadow:none;padding:8px 12px}
+input[type=text],input[type=password]{background:rgba(0,0,0,.4);border:1px solid rgba(0,240,255,.35);
+  color:#e6f7ff;border-radius:10px;padding:10px 12px;font-family:inherit;width:100%}
+.grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fill,minmax(230px,1fr))}
+.dim{opacity:.5}
+.topbar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px;margin-bottom:28px}
+.ch{padding:14px;display:flex;gap:12px;align-items:center;cursor:pointer;transition:transform .2s}
+.ch:hover{transform:translateY(-3px);box-shadow:0 0 40px rgba(255,0,230,.3)}
+.ch img{width:56px;height:56px;border-radius:50%;border:2px solid var(--accent)}
+.ch small,.row small{display:block;opacity:.6;font-size:11px;letter-spacing:.1em}
+.vid{padding:10px;cursor:pointer;transition:transform .2s}
+.vid:hover{transform:translateY(-3px)}
+.thumb{position:relative;border-radius:12px;overflow:hidden}
+.thumb img{width:100%;display:block}
+.badge{position:absolute;top:8px;right:8px;font-size:10px;padding:4px 8px;border-radius:8px;
+  background:rgba(0,0,0,.7);text-transform:uppercase;letter-spacing:.1em;color:var(--accent)}
+.badge.private{color:var(--pink)}
+.vid p{font-size:13px;margin:10px 4px 2px;line-height:1.4}
+#player{margin:20px 0}
+#player iframe{width:100%;aspect-ratio:16/9;border:0;border-radius:18px;
+  box-shadow:0 0 50px rgba(0,240,255,.25)}
+.section{margin-top:34px}
+.section h2{font-size:14px;letter-spacing:.2em;text-transform:uppercase;color:var(--accent);margin:0 0 14px}
+.row{padding:14px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+.row img{width:48px;height:48px;border-radius:50%}
+.row div{flex:1;min-width:160px}
+.panel{padding:22px}
+label.inline{font-size:13px;display:flex;gap:6px;align-items:center}
 `;
 
-function loginPage(msg) {
-  return `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>YouTube Admin</title>
-<style>${BASE_CSS}form{max-width:340px;margin:12vh auto;background:#181b22;padding:24px;border-radius:14px;border:1px solid #262a35}input{margin:12px 0}</style>
-<form method=post action=/admin/youtube/login><h2 style="margin:0">YouTube Admin</h2>
-<input type=password name=password placeholder=Password autofocus><button style="width:100%">Login</button>
-<p style="color:#ff6b6b">${esc(msg)}</p></form>`;
-}
+function siteHTML() {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nexus Tube</title><style>${BASE_CSS}</style></head>
+<body><div class="wrap">
+  <div class="topbar">
+    <div><h1 id="title">Loading</h1><div class="sub" id="subtitle"></div></div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <a class="btn" href="/auth/start?role=user">CONNECT YOUR CHANNEL</a>
+      <button class="btn ghost" id="logout">DISCONNECT SESSION</button>
+    </div>
+  </div>
 
-function adminPage() {
-  return `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>YouTube Admin</title>
-<style>${BASE_CSS}
-.panel{background:#181b22;border:1px solid #262a35;border-radius:12px;padding:16px;margin-bottom:16px}
-.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.pill{padding:3px 10px;border-radius:99px;font-size:12px;font-weight:700}
-.ok{background:#12351f;color:#4ade80}.bad{background:#3a1616;color:#ff6b6b}.card.hid{opacity:.35}
-.chan{display:flex;gap:12px;align-items:center}.chan img{width:48px;height:48px;border-radius:50%}
-details summary{cursor:pointer;color:#8b93a7}pre{white-space:pre-wrap;background:#12141a;padding:10px;border-radius:8px;font-size:12px}
-</style>
-<div class=wrap>
-<div class=row style="justify-content:space-between"><h2 style="margin:0">YouTube Channel — Admin</h2>
-<div class=row><a class="btn sec" href=/youtube target=_blank>View site page</a><a class="btn sec" href=/admin/youtube/logout>Logout</a></div></div>
+  <div class="section"><h2>// Channels</h2><div class="grid" id="channels"></div></div>
 
-<div class=panel id=statusBox style="margin-top:16px">Loading…</div>
-
-<div class=panel>
-<h3 style="margin-top:0">Connect with cookie (cURL bash)</h3>
-<details><summary>How to get it</summary><pre>1. Open youtube.com in Chrome, logged in to the channel's account.
-2. F12 → Network tab → reload → click the first "www.youtube.com" request.
-3. Right click → Copy → Copy as cURL (bash).
-4. Paste below. A bare "Cookie: ..." line also works.</pre></details>
-<textarea id=curl rows=6 placeholder="curl 'https://www.youtube.com/' -H 'cookie: SID=...; SAPISID=...' ..." style="margin-top:10px"></textarea>
-<input id=chan placeholder="Channel handle or ID (optional — auto-detected from the cookie)" style="margin-top:8px;font-family:inherit">
-<div class=row style="margin-top:10px"><button id=btnConnect>Connect &amp; sync</button><span id=msg></span></div>
+  <div id="videos-wrap" hidden class="section">
+    <h2 id="vtitle"></h2>
+    <div id="player"></div>
+    <div class="grid" id="videos"></div>
+  </div>
 </div>
-
-<div class=row style="margin-bottom:12px"><h3 style="margin:0" id=vidTitle>Videos</h3>
-<button class=sec id=btnSync>Sync now</button><button class=sec id=btnDisc>Disconnect</button></div>
-<div class=grid id=grid></div>
-</div>
-<script>
-const $=id=>document.getElementById(id);
-const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function api(path,opts){const r=await fetch(path,opts);let d={};try{d=await r.json()}catch(e){}if(r.status===401)location.reload();return d}
-function setMsg(t,bad){$('msg').textContent=t;$('msg').style.color=bad?'#ff6b6b':'#4ade80'}
-async function load(){
-  const s=await api('/admin/api/yt/status');
-  let h='';
-  if(s.connected){
-    h+='<div class=chan>'+(s.channel.avatar?'<img src="'+esc(s.channel.avatar)+'">':'')+
-    '<div><b>'+esc(s.channel.title||s.channel.id||'Channel')+'</b><div style="color:#8b93a7;font-size:12px">'+esc(s.channel.id||'')+'</div></div>'+
-    '<span class="pill '+(s.status==='connected'?'ok':'bad')+'">'+(s.status==='connected'?'CONNECTED':'COOKIE '+esc((s.status||'?').toUpperCase()))+'</span></div>'+
-    '<div style="margin-top:8px;color:#8b93a7;font-size:13px">Cookie stored ('+s.cookieInfo.names.length+' cookies: '+esc(s.cookieInfo.names.slice(0,8).join(', '))+'…) · '+s.total+' videos ('+s.hidden+' hidden) · last sync '+(s.lastSync?new Date(s.lastSync).toLocaleString():'never')+'</div>';
-  } else h='<span class="pill bad">NOT CONNECTED</span> Paste a cURL below to connect your channel.';
-  $('statusBox').innerHTML=h;
-  $('vidTitle').textContent='Videos ('+s.total+')';
-  $('grid').innerHTML=s.videos.map(v=>'<div class="card'+(v.hidden?' hid':'')+'"><img loading=lazy src="'+esc(v.thumb)+'"><div class=t>'+esc(v.title)+'</div>'+
-   '<div class=m>'+esc([v.duration,v.views,v.published].filter(Boolean).join(' · '))+'</div>'+
-   '<div class=m><button class=sec data-id="'+esc(v.id)+'" data-h="'+(v.hidden?0:1)+'">'+(v.hidden?'Show on site':'Hide from site')+'</button> <a href="https://youtu.be/'+esc(v.id)+'" target=_blank>open</a></div></div>').join('');
-}
-$('grid').onclick=async e=>{const b=e.target.closest('button[data-id]');if(!b)return;
-  await api('/admin/api/yt/hide',{method:'POST',body:JSON.stringify({id:b.dataset.id,hidden:b.dataset.h==='1'})});load()};
-$('btnConnect').onclick=async()=>{
-  $('btnConnect').disabled=true;setMsg('Connecting & syncing…');
-  const d=await api('/admin/api/yt/connect',{method:'POST',body:JSON.stringify({curl:$('curl').value,channel:$('chan').value})});
-  $('btnConnect').disabled=false;
-  if(d.ok){setMsg('Connected — '+d.count+' videos synced.');$('curl').value='';}else setMsg(d.error||'Failed',true);
-  load()};
-$('btnSync').onclick=async()=>{$('btnSync').disabled=true;const d=await api('/admin/api/yt/sync',{method:'POST'});
-  $('btnSync').disabled=false;setMsg(d.ok?('Synced '+d.count+' videos.'):(d.error||'Failed'),!d.ok);load()};
-$('btnDisc').onclick=async()=>{if(!confirm('Remove the stored cookie? (videos stay on the site)'))return;
-  await api('/admin/api/yt/disconnect',{method:'POST'});load()};
-load();
-</script>`;
+<script>(${SITE_JS})();</script>
+</body></html>`;
 }
 
-function sitePage(videos, title, avatar) {
-  const data = JSON.stringify(videos).replace(/</g, "\\u003c");
-  return `<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>${esc(title || "Videos")}</title>
-<style>${BASE_CSS}
-.head{display:flex;align-items:center;gap:12px;margin-bottom:18px}.head img{width:44px;height:44px;border-radius:50%}
-#player{display:none;margin-bottom:20px}#player .box{position:relative;aspect-ratio:16/9;background:#000;border-radius:12px;overflow:hidden}
-#player iframe{position:absolute;inset:0;width:100%;height:100%;border:0}#ptitle{font-weight:700;font-size:18px;margin:10px 0}
-</style>
-<div class=wrap>
-<div class=head>${avatar ? `<img src="${esc(avatar)}">` : ""}<h2 style="margin:0">${esc(title || "Videos")}</h2></div>
-<div id=player><div class=box id=pbox></div><div id=ptitle></div></div>
-<div class=grid id=grid></div></div>
-<script>
-const V=${data};
-const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-document.getElementById('grid').innerHTML=V.map(v=>'<div class=card data-id="'+esc(v.id)+'"><img loading=lazy src="'+esc(v.thumb)+'"><div class=t>'+esc(v.title)+'</div><div class=m>'+esc([v.duration,v.views,v.published].filter(Boolean).join(' · '))+'</div></div>').join('');
-function play(id){const v=V.find(x=>x.id===id);if(!v)return;
-  document.getElementById('pbox').innerHTML='<iframe src="https://www.youtube-nocookie.com/embed/'+encodeURIComponent(id)+'?autoplay=1&rel=0" allow="autoplay; encrypted-media; picture-in-picture; fullscreen" allowfullscreen></iframe>';
-  document.getElementById('ptitle').textContent=v.title;document.getElementById('player').style.display='block';
-  history.replaceState(null,'','#'+id);scrollTo({top:0,behavior:'smooth'})}
-document.getElementById('grid').onclick=e=>{const c=e.target.closest('.card');if(c)play(c.dataset.id)};
-if(location.hash.length>1)play(location.hash.slice(1));
-</script>`;
+function adminHTML(loggedIn) {
+  const body = loggedIn ? `
+  <div class="topbar">
+    <div><h1>Control Room</h1><div class="sub">ADMIN PANEL</div></div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <a class="btn" href="/auth/start?role=admin">CONNECT MY CHANNEL</a>
+      <a class="btn ghost" href="/">VIEW SITE</a>
+      <a class="btn ghost" href="/admin/logout">LOGOUT</a>
+    </div>
+  </div>
+  <div id="panel">
+    <div class="glass panel section">
+      <h2>// Site settings</h2>
+      <p>Status: <b id="pub-state">--</b></p>
+      <label>Title<input type="text" id="s-title"></label><br><br>
+      <label>Subtitle<input type="text" id="s-sub"></label><br><br>
+      <label>Accent color <input type="color" id="s-accent"></label><br><br>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn ghost" data-act="save">SAVE</button>
+        <button class="btn" id="pub-btn" data-act="pub" data-pub="1">PUBLISH SITE</button>
+      </div>
+    </div>
+    <div class="section"><h2>// Connected channels</h2><div id="chs"></div></div>
+  </div>` : `
+  <div class="glass panel" style="max-width:380px;margin:12vh auto">
+    <h1 style="font-size:20px">Admin Login</h1><br>
+    <form method="POST" action="/admin/login">
+      <input type="password" name="password" placeholder="Admin password" required>
+      <br><br><button class="btn" type="submit">ENTER</button>
+    </form>
+  </div>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin · Nexus Tube</title><style>${BASE_CSS}</style></head>
+<body><div class="wrap">${body}</div>
+${loggedIn ? `<script>(${ADMIN_JS})();</script>` : ""}
+</body></html>`;
 }
 
-// ---------------------------------------------------------- standalone mode
-export default {
-  async fetch(request, env, ctx) {
-    const r = await handleYouTube(request, env, ctx);
-    if (r) return r;
-    return Response.redirect(new URL("/youtube", request.url).toString(), 302);
-  },
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(syncYouTube(env));
-  },
-};
+/* ---------- client scripts (plain functions, serialized into the page) ---------- */
+
+function SITE_JS() {
+  const $ = (s) => document.querySelector(s);
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+  function card(c, tag) {
+    return '<div class="glass ch" data-id="' + esc(c.id) + '"><img src="' + esc(c.thumb) +
+      '"><div><b>' + esc(c.title) + '</b><small>' + tag + '</small></div></div>';
+  }
+
+  async function load() {
+    const s = await (await fetch("/api/site")).json();
+    document.title = s.title;
+    $("#title").textContent = s.title;
+    $("#subtitle").textContent = s.subtitle;
+    document.documentElement.style.setProperty("--accent", s.accent || "#00f0ff");
+    const cards = [];
+    if (s.featured) cards.push(card(s.featured, "FEATURED"));
+    s.users.forEach((u) => cards.push(card(u, "MEMBER")));
+    $("#channels").innerHTML = cards.join("") || '<p class="dim">No channels yet.</p>';
+    if (location.hash.startsWith("#/c/")) openChannel(location.hash.slice(4));
+  }
+
+  async function openChannel(id) {
+    const r = await fetch("/api/channel/" + encodeURIComponent(id) + "/videos");
+    const d = await r.json();
+    if (!r.ok) return alert(d.error || "Could not load channel");
+    location.hash = "#/c/" + id;
+    $("#vtitle").textContent = d.channel.title + " // " + d.videos.length + " videos" +
+      (d.canPrivate ? " (owner view: includes private)" : "");
+    $("#videos").innerHTML = d.videos.map((v) =>
+      '<div class="glass vid" data-vid="' + esc(v.id) + '" data-priv="' + esc(v.privacy) + '">' +
+      '<div class="thumb"><img src="' + esc(v.thumb) + '"><span class="badge ' + esc(v.privacy) + '">' +
+      esc(v.privacy) + '</span></div><p>' + esc(v.title) + '</p></div>').join("") ||
+      '<p class="dim">No videos found.</p>';
+    $("#videos-wrap").hidden = false;
+    $("#player").innerHTML = "";
+    $("#videos-wrap").scrollIntoView({ behavior: "smooth" });
+  }
+
+  function play(id, privacy) {
+    if (privacy === "private") {
+      $("#player").innerHTML = '<p class="dim">Private videos open on YouTube. They play only in the browser where the owner is signed into that Google account.</p>';
+      window.open("https://www.youtube.com/watch?v=" + encodeURIComponent(id), "_blank");
+      return;
+    }
+    $("#player").innerHTML = '<iframe src="https://www.youtube.com/embed/' + encodeURIComponent(id) +
+      '?autoplay=1" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>';
+    $("#player").scrollIntoView({ behavior: "smooth" });
+  }
+
+  document.addEventListener("click", (e) => {
+    const ch = e.target.closest(".ch");
+    if (ch) return openChannel(ch.dataset.id);
+    const v = e.target.closest(".vid");
+    if (v) return play(v.dataset.vid, v.dataset.priv);
+    if (e.target.id === "logout") {
+      fetch("/api/logout", { method: "POST" }).then(() => alert("Session cleared"));
+    }
+  });
+
+  load();
+}
+
+function ADMIN_JS() {
+  const $ = (s) => document.querySelector(s);
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+  async function post(url, body) {
+    const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const d = await r.json();
+    if (!r.ok) alert(d.error || "Request failed");
+    return d;
+  }
+
+  async function load() {
+    const d = await (await fetch("/api/admin/state")).json();
+    const s = d.settings;
+    $("#s-title").value = s.title;
+    $("#s-sub").value = s.subtitle;
+    $("#s-accent").value = s.accent || "#00f0ff";
+    $("#pub-state").textContent = s.published ? "LIVE" : "DRAFT";
+    $("#pub-btn").textContent = s.published ? "UNPUBLISH" : "PUBLISH SITE";
+    $("#pub-btn").dataset.pub = s.published ? "0" : "1";
+    $("#chs").innerHTML = d.channels.map((c) =>
+      '<div class="glass row"><img src="' + esc(c.thumb) + '"><div><b>' + esc(c.title) +
+      '</b><small>' + esc(c.kind) + ' · ' + esc(c.id) + '</small></div>' +
+      '<label class="inline"><input type="radio" name="feat" value="' + esc(c.id) + '"' +
+      (s.featured === c.id ? " checked" : "") + '> featured</label>' +
+      '<button class="btn danger" data-act="del" data-id="' + esc(c.id) + '">REMOVE</button></div>'
+    ).join("") || '<p class="dim">No channels connected yet. Click CONNECT MY CHANNEL.</p>';
+  }
+
+  document.addEventListener("click", async (e) => {
+    const b = e.target.closest("[data-act]");
+    if (!b) return;
+    const act = b.dataset.act;
+    if (act === "save") {
+      await post("/api/admin/settings", { title: $("#s-title").value, subtitle: $("#s-sub").value, accent: $("#s-accent").value });
+    } else if (act === "pub") {
+      await post("/api/admin/settings", { published: b.dataset.pub === "1" });
+    } else if (act === "del" && confirm("Remove this channel?")) {
+      await fetch("/api/admin/channel/" + encodeURIComponent(b.dataset.id), { method: "DELETE" });
+    }
+    load();
+  });
+
+  document.addEventListener("change", async (e) => {
+    if (e.target.name === "feat") await post("/api/admin/settings", { featured: e.target.value });
+    load();
+  });
+
+  load();
+}
