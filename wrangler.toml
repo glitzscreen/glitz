@@ -3,5 +3,5 @@
    compatibility_date = "2024-11-01"
 
    [[kv_namespaces]]
-   binding = "YT_STORE"
-   id = "45bb57b6044744fbbbcfe6a84cbfbdf6"
+   binding = "LINK_STORE"
+   id = "0e59d3b9e2fd46cab803d398323b6946"
